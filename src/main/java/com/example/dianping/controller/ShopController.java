@@ -56,7 +56,7 @@ public class ShopController {
         return Result.success();
     }
     @GetMapping("/pages")
-    public Result<Page<Shop>> page(@RequestParam(value = "page",defaultValue = "1") @Positive(message = "至少要大于0") Long page
+    public Result<Page<Shop>> page(@RequestParam(value = "page",defaultValue = "1") @Max(100) @Positive(message = "至少要大于0") Long page
             ,@RequestParam(value = "size",defaultValue = "10") @Min(value = 1,message ="最小为5页" ) @Max(20) Long size
             ,@RequestParam(value = "name",required = false) String shopName
             ,@RequestParam(value = "sortBy",required = false) String sortBy

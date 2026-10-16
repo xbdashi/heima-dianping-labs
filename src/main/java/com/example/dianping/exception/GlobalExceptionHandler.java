@@ -2,6 +2,7 @@ package com.example.dianping.exception;
 
 import com.example.dianping.common.Result;
 import jakarta.validation.ConstraintViolationException;
+
 import org.springframework.http.HttpStatus;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -43,5 +44,20 @@ public class GlobalExceptionHandler {
     public Result<Void> handleManyRequestException(ManyRequestException e){
 
         return Result.error(429, e.getMessage());
+    }
+    @ExceptionHandler(ServiceUnavailableException.class)
+    @ResponseStatus(HttpStatus.SERVICE_UNAVAILABLE)
+    public Result<Void> handleServiceUnavailable(ServiceUnavailableException e) {
+        return Result.error(503, e.getMessage());
+    }
+    @ExceptionHandler(BadRequestException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public Result<Void> handleBadRequest(BadRequestException e) {
+        return Result.error(400, e.getMessage());
+    }
+    @ExceptionHandler(UnauthorizedException.class)
+    @ResponseStatus(HttpStatus.UNAUTHORIZED)
+    public Result<Void> handleUnauthorized(UnauthorizedException e) {
+        return Result.error(401, e.getMessage());
     }
 }

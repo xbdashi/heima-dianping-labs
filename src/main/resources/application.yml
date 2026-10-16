@@ -29,3 +29,6 @@ my:
   redis:
     ttl: 72000
     cache-null: 120
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl

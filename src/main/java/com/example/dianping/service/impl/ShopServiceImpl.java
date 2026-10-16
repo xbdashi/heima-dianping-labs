@@ -2,6 +2,7 @@ package com.example.dianping.service.impl;
 
 import cn.hutool.core.lang.UUID;
 import cn.hutool.core.util.BooleanUtil;
+import cn.hutool.core.util.RandomUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
@@ -10,6 +11,7 @@ import com.example.dianping.constant.RedisConstants;
 import com.example.dianping.entity.Shop;
 import com.example.dianping.entity.redis.RedisData;
 import com.example.dianping.exception.ManyRequestException;
+import com.example.dianping.exception.ServiceUnavailableException;
 import com.example.dianping.exception.ShopNotFoundException;
 import com.example.dianping.mapper.ShopMapper;
 import com.example.dianping.service.ShopService;
@@ -17,14 +19,15 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.tomcat.util.json.JSONParser;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.json.JsonParser;
-import org.springframework.core.NestedRuntimeException;
+
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.dao.DataAccessException;
-import org.springframework.data.redis.RedisConnectionFailureException;
+
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
@@ -39,6 +42,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
 public class ShopServiceImpl implements ShopService {
@@ -49,6 +53,8 @@ public class ShopServiceImpl implements ShopService {
     private StringRedisTemplate stringRedisTemplate;
     @Autowired
     private ObjectMapper objectMapper;
+    @Autowired
+    private RedissonClient redissonClient;
     @Value("${my.redis.ttl}")
     private Long redisTtl;
     @Value("${my.redis.cache-null}")
@@ -57,106 +63,50 @@ public class ShopServiceImpl implements ShopService {
     private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
     // 定义定时任务线程池
     private static final ScheduledExecutorService scheduler = new ScheduledThreadPoolExecutor(1);
+    private final Semaphore degradeGate = new Semaphore(8); // 降级限流器
+    private static final int REDIS_FAILURE_THRESHOLD = 3; // 连续失败最大次数
+    private static final long REDIS_OPEN_MILLIS = 5000; // 熔断时间5秒
+    private final AtomicInteger redisFailures = new AtomicInteger(0); // 连续失败次数计数器
+    private volatile long redisOpenUntil = 0;
     @Override
     public Shop selectById(Long id) {
+        if (!redisAllowAttempt()) {
+            System.out.println("[熔断] 开路中：跳过 Redis，直接降级"+LocalDateTime.now());
+            return degradeSelectById(id);
+        }
         // 先查询redis，击中返回，没击中查询数据然后存入缓存
-        RedisData<Shop> redisShop = selectShopRedis(id);
-        if (redisShop != null) {
-            String uuidAsync = UUID.randomUUID().toString();
+        RedisData<Shop> redisShop=null;
+        try {
+            redisShop = selectShopRedis(id);
+            redisRecordSuccess();
+        } catch (DataAccessException e) {
+            System.out.println("[降级] Redis 读取失败，走应急通道");
+            redisRecordFailure();
+            return degradeSelectById(id);
+        }
+        if (!Objects.isNull(redisShop)) {
+            // String uuidAsync = UUID.randomUUID().toString();
             // 缓存未过期，直接返回
             if (redisShop.getExpire() != null
                     && LocalDateTime.now().isBefore(redisShop.getExpire())
-                    ) {
+            ) {
                 return redisShop.getData();
-            } else { //缓存存在但已过期
-                boolean tryLock = tryLock(id, uuidAsync);
-                System.out.println(Thread.currentThread().getName() + " 尝试获取锁:"+tryLock);
-                if (tryLock) { // 只有拿到锁的线程可以尝试访问数据库
-                    try{
-                        long start = System.nanoTime();
-                        AtomicBoolean lockValid = new AtomicBoolean(true);
-                        CACHE_REBUILD_EXECUTOR.submit(() -> {
-                            ScheduledFuture<?> scheduledFuture = null ;
-                            try {
-                                scheduledFuture = scheduler.scheduleAtFixedRate(() -> {
-                                    try{
-                                        if (!this.renewLock(id, uuidAsync)) {
-                                            lockValid.set(false);
-                                        }
-                                    }catch (Exception e){
-                                        lockValid.set(false);
-                                        System.out.println("锁续期失败");
-                                        e.printStackTrace();
-                                    }
-                                }, 0, 3, TimeUnit.SECONDS);
-                                Shop shop = shopMapper.selectById(id);
-                                if (!lockValid.get()) {
-                                    return;
-                                }
-                                if (shop != null) {
-                                    // writeShopIntoRedisWithExpire(shop, 30, ChronoUnit.MINUTES);
-                                    boolean success = writeCacheIfLock(
-                                            RedisConstants.LOCK_SHOP_KEY + id,
-                                            RedisConstants.DP_KEY_SHOP + id,
-                                            uuidAsync,
-                                            shop
-                                    );
-
-                                    if (success) {
-                                        System.out.println("缓存写入成功");
-                                    } else {
-                                        System.out.println("锁已失效，放弃写入缓存");
-                                    }
-                                } else {
-                                    System.out.println(Thread.currentThread().getName()+"查询数据为空,存入null值");
-                                    // stringRedisTemplate.opsForValue().set(RedisConstants.DP_KEY_SHOP + id, RedisConstants.CACHE_NULL, cacheNull, TimeUnit.SECONDS);
-                                    writeCacheIfLock(
-                                            RedisConstants.LOCK_SHOP_KEY + id,
-                                            RedisConstants.DP_KEY_SHOP + id,
-                                            uuidAsync,
-                                            RedisConstants.CACHE_NULL
-                                    );
-                                }
-                            }catch (Exception e){
-                                e.printStackTrace();
-                                System.out.println(Thread.currentThread().getName() + "缓存重建失败");
-                            }finally {
-                                long costMs = (System.nanoTime() - start) / 1_000_000;
-                                System.out.println("缓存重建耗时：" + costMs + " ms");
-                                if (scheduledFuture != null) {
-                                    scheduledFuture.cancel(false);
-                                }
-                                unlock(id, uuidAsync);
-                            }
-                        });
-                    }catch (Exception e){
-                        unlock(id, uuidAsync);
-                        throw e;
-                    }
-
-                }
-                // 如果没拿到锁就直接返回
+            } else { // 缓存存在但已过期：交给后台"谁抢到锁谁重建"，本请求直接返回旧数据
+                CACHE_REBUILD_EXECUTOR.submit(() -> rebuildCache(id));
                 return redisShop.getData();
             }
+
         }
-
-
-        // 缓存不存在，继续原来的处理流程
-        // 如果执行到这里就说明没有击中缓存
-        String uid = UUID.randomUUID().toString();
+        // ===== 缓存不存在（回源路径）：Redisson 锁 =====
+        RLock lock = redissonClient.getLock(RedisConstants.LOCK_SHOP_KEY + id);
         boolean retryFailed = false;
-        boolean tryLock = tryLock(id, uid);
-
-        if (!tryLock) {
-            // 进入方法了说明获取失败
+        boolean locked = lock.tryLock();   // 不等待；不传租约时间 → 看门狗自动续期
+        if (!locked) {
             try {
                 for (int i = 0; i < 10; i++) {
-                    // 尝试加载缓存
                     RedisData<Shop> shop = selectShopRedis(id);
                     if (shop != null) return shop.getData();
-                    // 尝试拿锁
-
-                    if (tryLock(id, uid)) {
+                    if (lock.tryLock()) {
                         retryFailed = false;
                         break;
                     }
@@ -165,127 +115,143 @@ public class ShopServiceImpl implements ShopService {
                     }
                     retryFailed = true;
                 }
-
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new RuntimeException(e);
             }
-
         }
         if (retryFailed) {
             throw new ManyRequestException("请求过于频繁");
         }
-        RedisData<Shop> shop;
         Shop shopData = null;
         try {
-            // 再次检查缓存
-            shop = selectShopRedis(id);
+            // 拿到锁后二次查缓存（避免重复查库）
+            RedisData<Shop> shop = selectShopRedis(id);
             if (shop != null) return shop.getData();
-            System.out.println(
-                    Thread.currentThread().getName()
-                            + " 查询 MySQL，店铺 ID：" + id
-            );
-            // Thread.sleep(300); // 模拟查询耗时
-            shopData = shopMapper.selectById(id);
+            System.out.println(Thread.currentThread().getName() + " 查询 MySQL，店铺 ID：" + id);
+            shopData = queryShopFromDb(id);
             if (shopData == null) {
-                // 把空值写入redis
-                try {
-                    // stringRedisTemplate.opsForValue().set(RedisConstants.DP_KEY_SHOP + id,
-                    //        RedisConstants.CACHE_NULL, cacheNull, TimeUnit.SECONDS);
-                    writeCacheIfLock(
-                            RedisConstants.LOCK_SHOP_KEY + id,
-                            RedisConstants.DP_KEY_SHOP + id,
-                            uid,
-                            RedisConstants.CACHE_NULL
-                    );
-                } catch (DataAccessException e) {
-                    // TODO redis日志
-                    System.out.println("Redis连接失败，写入失败");
-                }
+                writeNullCache(lock, id);
                 throw new ShopNotFoundException("没有id为%s的店铺".formatted(id));
             }
-            // 正常查询值存入redis
-            try {
-                //writeShopIntoRedisWithExpire(shopData, 30, ChronoUnit.MINUTES);
-                writeCacheIfLock(
-                        RedisConstants.LOCK_SHOP_KEY + id,
-                        RedisConstants.DP_KEY_SHOP + id,
-                        uid,
-                        shopData
-                );
-            } catch (DataAccessException e) {
-                // TODO redis日志
-                System.out.println("Redis连接失败，写入失败");
-            }
-        } catch (Exception e) {
-            throw new RuntimeException(e);
+            writeShopCache(lock, id, shopData);
         } finally {
-            unlock(id, uid);
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
         return shopData;
-
     }
-
-    /**
-     * 将店铺数据写入Redis
-     * @param lockKey 拿到当前缓存的锁的key
-     * @param redisShopKey redis中存储的店铺数据的key
-     * @param uid 当前请求的唯一标识，判断redis中拿到锁的人是否与当前一致
-     * @param shop 店铺数据
-     * @return
-     */
-    public boolean writeCacheIfLock(String lockKey,String redisShopKey,String uid,Shop shop){
-        RedisData<Shop> redisData = RedisData.build(shop, Duration.ofMinutes(30));
-        DefaultRedisScript<Long> drs = new DefaultRedisScript<>();
-        drs.setLocation(new ClassPathResource("lua/write_cache_if_lock.lua"));
-        drs.setResultType(Long.class);
+    // 逻辑过期重建：后台线程自己抢锁执行（Redisson 锁认线程：谁抢谁放）
+    // 看门狗负责续期——原来的 renewLock + 调度器 + add_expire_time.lua 全部下岗
+    private void rebuildCache(Long id) {
+        RLock lock = redissonClient.getLock(RedisConstants.LOCK_SHOP_KEY + id);
+        if (!lock.tryLock()) {
+            return;   // 没抢到：别的线程正在重建
+        }
+        long start = System.nanoTime();
         try {
-            String result = objectMapper.writeValueAsString(redisData);
-            Long execute = stringRedisTemplate.execute(drs,
-                    List.of(lockKey, redisShopKey),
-                    uid,
-                    result,
-                    "0",
-                    cacheNull
-            );
-            return Long.valueOf(1L).equals(execute);
-        } catch (JsonProcessingException e) {
-            throw new RuntimeException(e);
+            Shop shop = shopMapper.selectById(id);
+            if (shop != null) {
+                writeShopCache(lock, id, shop);
+            } else {
+                writeNullCache(lock, id);
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            System.out.println(Thread.currentThread().getName() + "缓存重建失败");
+        } finally {
+            System.out.println("缓存重建耗时：" + (System.nanoTime() - start) / 1_000_000 + " ms");
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
     }
 
-    /**
-     * 如果没查到数据使用此方法写入缓存
-     * @param lockKey
-     * @param redisShopKey
-     * @param uid
-     * @param data  直接填空值
-     * @return 是否设置过期时间 如果1 为设置 0为不设置
-     */
-    public boolean writeCacheIfLock(String lockKey,String redisShopKey,String uid,String data){
-        DefaultRedisScript<Long> drs = new DefaultRedisScript<>();
-        drs.setLocation(new ClassPathResource("lua/write_cache_if_lock.lua"));
-        drs.setResultType(Long.class);
+    // 持有锁期间写回店铺缓存（看门狗保证持有期间锁不过期；写前用本地状态兜底检查）
+    private void writeShopCache(RLock lock, Long id, Shop shop) {
+        if (!lock.isHeldByCurrentThread()) {
+            System.out.println("锁已失效，放弃写入缓存");
+            return;
+        }
         try {
-            Long execute = stringRedisTemplate.execute(drs,
-                    List.of(lockKey, redisShopKey),
-                    uid,
-                    data,
-                    "1",
-                    cacheNull
-            );
-            return Long.valueOf(1L).equals(execute);
-        }catch (Exception e){
+            RedisData<Shop> redisData = RedisData.build(shop, Duration.ofMinutes(30 + RandomUtil.randomInt(5)));
+            String json = objectMapper.writeValueAsString(redisData);
+            stringRedisTemplate.opsForValue().set(RedisConstants.DP_KEY_SHOP + id, json);
+        } catch (JsonProcessingException e) {
             throw new RuntimeException(e);
+        } catch (DataAccessException e) {
+            System.out.println("Redis连接失败，写入缓存失败");
+        }
+    }
+
+    // 负缓存写入（短 TTL，物理过期）
+    private void writeNullCache(RLock lock, Long id) {
+        if (!lock.isHeldByCurrentThread()) {
+            return;
+        }
+        try {
+            stringRedisTemplate.opsForValue().set(
+                    RedisConstants.DP_KEY_SHOP + id,
+                    RedisConstants.CACHE_NULL,
+                    cacheNull,
+                    TimeUnit.SECONDS
+            );
+        } catch (DataAccessException e) {
+            System.out.println("Redis连接失败，写入负缓存失败");
+        }
+    }
+    // 受闸门保护的查库：前台所有查 MySQL 都从这里走
+    private Shop queryShopFromDb(Long id) {
+        if (!degradeGate.tryAcquire()) {
+            throw new ServiceUnavailableException("服务繁忙，请稍后再试");
+        }
+        try {
+            return shopMapper.selectById(id);
+        } finally {
+            degradeGate.release();
+        }
+    }
+    private Shop degradeSelectById(Long id) {
+        Shop shop = queryShopFromDb(id);
+        if (shop == null) {
+            throw new ShopNotFoundException("没有id为%s的店铺".formatted(id));
+        }
+        return shop;
+    }
+    /**
+     * System.currentTimeMillis() 是当前时间的毫秒数（一个大数字）。这一行就是拿"现在"和"可以再试的时间点"比：
+     * - 闭合时 redisOpenUntil = 0：现在永远 ≥ 0，返回 true，可以试；
+     * - 开路中：redisOpenUntil 是未来时间，现在 < 它，返回 false，跳过；
+     * - 冷却到点：现在 ≥ 它，返回 true，允许去试（这就是"探测"）。
+     * @return
+     */
+    private boolean redisAllowAttempt() {
+        return System.currentTimeMillis() >= redisOpenUntil;
+    }
+    private void redisRecordSuccess() {
+        if (redisOpenUntil != 0) {
+            System.out.println("[熔断] 探测成功，恢复闭合");
+        }
+        redisFailures.set(0);
+        redisOpenUntil = 0;
+    }
+    private void redisRecordFailure() {
+        int failures = redisFailures.incrementAndGet();
+        System.out.println("[熔断] 记录失败（连续=" + failures + "）");
+        if (failures >= REDIS_FAILURE_THRESHOLD) {
+            redisOpenUntil = System.currentTimeMillis() + REDIS_OPEN_MILLIS;
+            System.out.println("[熔断] 连续失败 " + failures + " 次，跳闸 " + REDIS_OPEN_MILLIS / 1000 + " 秒");
         }
     }
     /**
      * 续期逻辑
-     * @param id 店铺id
+     *
+     * @param id  店铺id
      * @param uid 唯一标识
      * @return
      */
-    private boolean renewLock(Long id, String uid){
+    public boolean renewLock(Long id, String uid) {
         DefaultRedisScript<Long> ds = new DefaultRedisScript<>();
         ds.setLocation(new ClassPathResource("lua/add_expire_time.lua"));
         ds.setResultType(Long.class);
@@ -293,10 +259,11 @@ public class ShopServiceImpl implements ShopService {
                 ds,
                 List.of(RedisConstants.LOCK_SHOP_KEY + id),
                 uid,
-                10L
+                "10"
         );
-        return Long.valueOf(1L).equals(result);
+        return Long.valueOf(1).equals(result);
     }
+
     /**
      * 封装RedisData 对象 加上逻辑过期时间
      *
@@ -319,13 +286,7 @@ public class ShopServiceImpl implements ShopService {
     }
 
     public RedisData<Shop> selectShopRedis(Long id) {
-        String shopJson = null;
-        try {
-            shopJson = stringRedisTemplate.opsForValue().get(RedisConstants.DP_KEY_SHOP + id);
-        } catch (DataAccessException e) {
-            // TODO redis日志
-            System.out.println("Redis连接失败，读取失败");
-        }
+        String shopJson = stringRedisTemplate.opsForValue().get(RedisConstants.DP_KEY_SHOP + id);
         try {
             if (shopJson != null && !shopJson.isBlank()) {
                 if (RedisConstants.CACHE_NULL.equals(shopJson)) {
