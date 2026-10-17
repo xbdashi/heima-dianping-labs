@@ -1,6 +1,9 @@
 package com.example.dianping;
 
+import com.example.dianping.constant.RedisConstants;
+import com.example.dianping.entity.SeckillVoucher;
 import com.example.dianping.limiters.ShopRateLimiter;
+import com.example.dianping.mapper.SeckillVoucherMapper;
 import com.example.dianping.service.ShopService;
 import com.example.dianping.service.impl.ShopServiceImpl;
 import org.junit.jupiter.api.Assertions;
@@ -80,5 +83,20 @@ public class TestDemo {
         System.out.println("当前线程持有：" + lock.isHeldByCurrentThread());
         lock.unlock();
         System.out.println("释放完成");
+    }
+    @Autowired
+    private SeckillVoucherMapper seckillVoucherMapper;
+
+    @Test
+    void preheatSeckillVoucher() {
+        Long voucherId = 1L;
+        // 1. 从 MySQL 读活动状态
+        SeckillVoucher voucher = seckillVoucherMapper.selectById(voucherId);
+        // 2. 库存 → Redis(裸数字字符串)
+        stringRedisTemplate.opsForValue().set(
+                RedisConstants.SECKILL_STOCK_KEY + voucherId,
+                String.valueOf(voucher.getStock()));
+        // 3. 已购用户集合清空(新活动从零开始)
+        stringRedisTemplate.delete(RedisConstants.SECKILL_ORDER_KEY + voucherId);
     }
 }
