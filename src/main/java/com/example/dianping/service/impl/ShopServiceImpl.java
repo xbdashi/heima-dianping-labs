@@ -1,12 +1,8 @@
 package com.example.dianping.service.impl;
-
-import cn.hutool.core.lang.UUID;
 import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.RandomUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
-import com.example.dianping.common.Result;
 import com.example.dianping.constant.RedisConstants;
 import com.example.dianping.entity.Shop;
 import com.example.dianping.entity.redis.RedisData;
@@ -18,33 +14,27 @@ import com.example.dianping.service.ShopService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.tomcat.util.json.JSONParser;
+import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.dao.DataAccessException;
-
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
-
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
-import java.time.temporal.TemporalUnit;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
+@Slf4j
 public class ShopServiceImpl implements ShopService {
 
     @Autowired
@@ -71,7 +61,7 @@ public class ShopServiceImpl implements ShopService {
     @Override
     public Shop selectById(Long id) {
         if (!redisAllowAttempt()) {
-            System.out.println("[熔断] 开路中：跳过 Redis，直接降级"+LocalDateTime.now());
+            log.debug("熔断开路中,跳过 Redis 直接降级, shopId={}", id);
             return degradeSelectById(id);
         }
         // 先查询redis，击中返回，没击中查询数据然后存入缓存
@@ -80,7 +70,7 @@ public class ShopServiceImpl implements ShopService {
             redisShop = selectShopRedis(id);
             redisRecordSuccess();
         } catch (DataAccessException e) {
-            System.out.println("[降级] Redis 读取失败，走应急通道");
+            log.warn("Redis 读取失败,进入降级通道, shopId={}", id, e);
             redisRecordFailure();
             return degradeSelectById(id);
         }
@@ -128,7 +118,7 @@ public class ShopServiceImpl implements ShopService {
             // 拿到锁后二次查缓存（避免重复查库）
             RedisData<Shop> shop = selectShopRedis(id);
             if (shop != null) return shop.getData();
-            System.out.println(Thread.currentThread().getName() + " 查询 MySQL，店铺 ID：" + id);
+            log.debug("回源查库, shopId={}", id);
             shopData = queryShopFromDb(id);
             if (shopData == null) {
                 writeNullCache(lock, id);
@@ -158,10 +148,10 @@ public class ShopServiceImpl implements ShopService {
                 writeNullCache(lock, id);
             }
         } catch (Exception e) {
-            e.printStackTrace();
-            System.out.println(Thread.currentThread().getName() + "缓存重建失败");
+            log.error("缓存重建失败, shopId={}", id, e);
+
         } finally {
-            System.out.println("缓存重建耗时：" + (System.nanoTime() - start) / 1_000_000 + " ms");
+            log.info("缓存重建流程结束, shopId={}, 耗时={}ms", id, (System.nanoTime() - start) / 1_000_000);
             if (lock.isHeldByCurrentThread()) {
                 lock.unlock();
             }
@@ -171,7 +161,7 @@ public class ShopServiceImpl implements ShopService {
     // 持有锁期间写回店铺缓存（看门狗保证持有期间锁不过期；写前用本地状态兜底检查）
     private void writeShopCache(RLock lock, Long id, Shop shop) {
         if (!lock.isHeldByCurrentThread()) {
-            System.out.println("锁已失效，放弃写入缓存");
+            log.debug("锁已失效,放弃写入缓存, shopId={}", id);
             return;
         }
         try {
@@ -181,7 +171,7 @@ public class ShopServiceImpl implements ShopService {
         } catch (JsonProcessingException e) {
             throw new RuntimeException(e);
         } catch (DataAccessException e) {
-            System.out.println("Redis连接失败，写入缓存失败");
+            log.warn("店铺缓存写入失败, shopId={}", id, e);
         }
     }
 
@@ -198,7 +188,7 @@ public class ShopServiceImpl implements ShopService {
                     TimeUnit.SECONDS
             );
         } catch (DataAccessException e) {
-            System.out.println("Redis连接失败，写入负缓存失败");
+            log.warn("空值缓存写入失败, shopId={}", id, e);
         }
     }
     // 受闸门保护的查库：前台所有查 MySQL 都从这里走
@@ -231,17 +221,17 @@ public class ShopServiceImpl implements ShopService {
     }
     private void redisRecordSuccess() {
         if (redisOpenUntil != 0) {
-            System.out.println("[熔断] 探测成功，恢复闭合");
+            log.info("Redis 熔断恢复,已闭合");
         }
         redisFailures.set(0);
         redisOpenUntil = 0;
     }
     private void redisRecordFailure() {
         int failures = redisFailures.incrementAndGet();
-        System.out.println("[熔断] 记录失败（连续=" + failures + "）");
+        log.debug("Redis 连续失败次数:{}", failures);
         if (failures >= REDIS_FAILURE_THRESHOLD) {
             redisOpenUntil = System.currentTimeMillis() + REDIS_OPEN_MILLIS;
-            System.out.println("[熔断] 连续失败 " + failures + " 次，跳闸 " + REDIS_OPEN_MILLIS / 1000 + " 秒");
+            log.warn("Redis 连续失败 {} 次,熔断开启 {} 秒", failures, REDIS_OPEN_MILLIS / 1000);
         }
     }
     /**
@@ -296,14 +286,11 @@ public class ShopServiceImpl implements ShopService {
                 });
             }
         } catch (JsonProcessingException e) {
-            // TODO 日志
-            System.out.println("Redis数据反序列化失败");
-            // TODO 删除原来的缓存以免后续没覆盖掉
+            log.warn("缓存反序列化失败,准备清除脏数据, shopId={}", id, e);
             try {
                 stringRedisTemplate.delete(RedisConstants.DP_KEY_SHOP + id);
             } catch (DataAccessException ee) {
-                // TODO redis日志
-                System.out.println("Redis连接失败，删除失败");
+                log.warn("脏缓存清除失败, shopId={}", id, ee);
             }
         }
         return null;
@@ -360,8 +347,7 @@ public class ShopServiceImpl implements ShopService {
         try {
             stringRedisTemplate.delete(RedisConstants.DP_KEY_SHOP + id);
         } catch (DataAccessException e) {
-            // TODO redis日志
-            System.out.println("Redis连接失败，删除失败");
+            log.error("更新后缓存删除失败,可能读到旧数据, shopId={}", id, e);
         }
         return oldSp;
     }
@@ -377,8 +363,7 @@ public class ShopServiceImpl implements ShopService {
         try {
             stringRedisTemplate.delete(RedisConstants.DP_KEY_SHOP + id);
         } catch (DataAccessException e) {
-            // TODO redis日志
-            System.out.println("Redis连接失败，删除失败");
+            log.error("删除后缓存清理失败,已删店铺仍可能被读到, shopId={}", id, e);
         }
     }
 

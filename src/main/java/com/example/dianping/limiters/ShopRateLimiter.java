@@ -1,6 +1,7 @@
 package com.example.dianping.limiters;
 
 import com.example.dianping.constant.RedisConstants;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.dao.DataAccessException;
@@ -12,6 +13,7 @@ import java.util.List;
 import java.util.Objects;
 
 @Component
+@Slf4j
 public class ShopRateLimiter {
 
     @Autowired
@@ -30,7 +32,7 @@ public class ShopRateLimiter {
         try {
             result = stringRedisTemplate.execute(redisScript, List.of(RedisConstants.DP_SHOP_LIMIT + ip));
         }catch (DataAccessException e){
-            e.printStackTrace();
+            log.warn("限流器 Redis 异常,按 fail-open 放行, ip={}", ip, e);
             return true; // redis出现异常时放行，由闸门保护
         }
         return Objects.equals(result, 1L);
