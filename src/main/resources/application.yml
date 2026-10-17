@@ -25,6 +25,14 @@ spring:
             max-active: 8
             # 从连接池获取连接 最大超时时间，小于等于0则表示不会超时
             max-wait: -1ms
+  rabbitmq:
+    host: 127.0.0.1
+    port: 5672
+    username: guest
+    password: guest
+    listener:
+      simple:
+        default-requeue-rejected: false   # 异常别无限重回队列,避免死循环
 my:
   redis:
     ttl: 72000
@@ -35,3 +43,4 @@ mybatis-plus:
 logging:
   level:
     com.example.dianping: debug     # 开发期;上线换 info
+
